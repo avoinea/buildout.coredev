@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""A concurrent wrapper for timing xmltestrunner tests for buildout.coredev."""
+from argparse import ArgumentParser
+from fnmatch import fnmatch
+from itertools import cycle
+from logging import Formatter
+from logging import getLogger
+from logging import INFO
+from logging import StreamHandler
+from logging.handlers import MemoryHandler
+from multiprocessing import cpu_count
+from multiprocessing import Pool
+from os import access
+from os import environ
+from os import killpg
+from os import path
+from os import pathsep
+from os import setpgrp
+from os import unlink
+from os import walk
+from os import X_OK
+from signal import SIGINT
+from signal import SIGKILL
+from signal import signal
+from subprocess import CalledProcessError
+from subprocess import check_output
+from subprocess import DEVNULL
+from subprocess import STDOUT
+from time import time
+import locale
+import re
+import sys
+
+
+def which(program):
+    def is_exe(fpath):
+        return path.isfile(fpath) and access(fpath, X_OK)
+
+    fpath, fname = path.split(program)
+    if fpath:
+        if is_exe(program):
+            return program
+    else:
+        for dpath in environ["PATH"].split(pathsep):
+            exe_file = path.join(dpath, program)
+            if is_exe(exe_file):
+                return exe_file
+
+    return None
+
+
+def humanize_time(seconds):
+    """Humanize a seconds based delta time.
+
+    Only handles time spans up to weeks for simplicity.
+    """
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    weeks, days = divmod(days, 7)
+
+    seconds = int(seconds)
+    minutes = int(minutes)
+    hours = int(hours)
+    days = int(days)
+    weeks = int(weeks)
+
+    output = []
+
+    if weeks:
+        quantifier = "weeks" if weeks > 1 or weeks == 0 else "week"
+        output.append("{} {}".format(weeks, quantifier))
+    if days:
+        quantifier = "days" if days > 1 or days == 0 else "day"
+        output.append("{} {}".format(days, quantifier))
+    if hours:
+        quantifier = "hours" if hours > 1 or hours == 0 else "hour"
+        output.append("{} {}".format(hours, quantifier))
+    if minutes:
+        quantifier = "minutes" if minutes > 1 or minutes == 0 else "minute"
+        output.append("{} {}".format(minutes, quantifier))
+
+    quantifier = "seconds" if seconds > 1 or seconds == 0 else "second"
+    output.append("{} {}".format(seconds, quantifier))
+
+    return " ".join(output)
+
+
+def setup_termination():
+    # Set the group flag so that subprocesses will be in the same group.
+    setpgrp()
+
+    def terminate(signum, frame):
+        # Kill the group (including main process) on terminal signal.
+        killpg(0, SIGKILL)
+
+    signal(SIGINT, terminate)
+
+
+def discover_tests():
+    logger.info("Discovering tests.")
+
+    batches = {}
+    layer = None
+
+    with Pool(CONCURRENCY) as p:
+        for result in p.imap_unordered(
+            fetch_test_discovery_output, (cmdline for cmdline in TEST_SUITES.values())
+        ):
+            for line in result:
+                if line.startswith("Listing"):
+                    layer = re.search("^Listing (.*) tests:", line).groups()[0]
+                    batches[layer] = {}
+
+                # All listed tests are indented with 2 spaces
+                if layer and line.startswith("  "):
+                    if not batches.get(layer):
+                        batches[layer] = 0
+                    batches[layer] += 1
+
+    return [
+        batch[0] for batch in sorted(batches.items(), key=lambda batch: -batch[1])
+    ]
+
+
+def fetch_test_discovery_output(cmdline):
+    output_encoding = sys.stdout.encoding
+
+    if output_encoding is None:
+        output_encoding = locale.getpreferredencoding()
+
+    output = check_output(cmdline, stderr=DEVNULL)
+
+    return output.decode(output_encoding).splitlines()
+
+
+def create_test_run_params():
+    test_run_params = [{'layers': []} for n in range(CONCURRENCY)]
+    param_indices = cycle(range(len(test_run_params)))
+    layers = discover_tests()
+
+    while layers:
+        test_run_params[next(param_indices)]['layers'].append(layers.pop(0))
+
+    return tuple(test_run_params)
+
+
+def remove_bytecode_files(directory_path):
+    logger.info("Removing bytecode files from %s", directory_path)
+
+    for filename in find_bytecode_files(directory_path):
+        unlink(filename)
+
+
+def find_bytecode_files(directory_path):
+    for root, _, files in walk(directory_path):
+        for name in files:
+            if fnmatch(name, "*.py[co]"):
+                yield path.join(root, name)
+
+
+def run_tests(test_run_params):
+    """Run and time 'bin/test --layer layer -m module [-m module]'.
+
+    Return the layer name, batch info, returncode and runtime.
+    """
+
+    params = ["bin/test"]
+    params.append("--all")
+    params.append("--xml")
+
+    layers = test_run_params.get("layers")
+
+    if layers:
+        for layer in layers:
+            params.append("--layer")
+            params.append(layer)
+
+    xvfb_screen_size = environ.get("XVFB_SCREEN_SIZE")
+    if xvfb_screen_size:
+        xvfb_params = [
+            "xvfb-run",
+            "-a",
+            "--server-args=-screen 0 {}".format(xvfb_screen_size),
+        ]
+        params = tuple(xvfb_params + params)
+    else:
+        params = tuple(params)
+
+    printable_params = " ".join(
+        ["'{}'".format(param) if " " in param else param for param in params]
+    )
+
+    logger.info("START - %s", " ".join(layers))
+    memory_handler.flush()
+
+    start = time()
+    try:
+        output = check_output(params, stderr=STDOUT, universal_newlines=True)
+        returncode = 0
+    except CalledProcessError as e:
+        output = e.output
+        returncode = e.returncode
+
+    runtime = time() - start
+
+    result = {"layers": layers, "returncode": returncode, "runtime": runtime}
+
+    done_args = ("DONE - %s in %s", " ".join(layers), humanize_time(runtime))
+
+    if returncode:
+        log_output.error("")
+
+        for line in output.splitlines():
+            log_output.error(line)
+
+        log_output.error("")
+        log_output.error("Command line")
+        log_output.error("")
+        log_output.error(printable_params)
+        log_output.error("")
+
+        stdout_handler.flush()
+
+        logger.error(*done_args)
+
+    else:
+        logger.info(*done_args)
+
+    memory_handler.flush()
+
+    return result
+
+
+def main():
+    """Discovers and times tests in parallel via multiprocessing.Pool()."""
+    # Remove *.py[co] files to avoid race conditions with parallel workers
+    # stepping on each other's toes when trying to clean up stale bytecode.
+    #
+    # Setting PYTHONDONTWRITEBYTECODE is not enough, because running buildout
+    # also already precompiles bytecode for some eggs.
+    remove_bytecode_files(SOURCE_PATH)
+
+    start = time()
+    test_run_params = create_test_run_params()
+    logger.info("Discovered tests in %s", humanize_time(time() - start))
+    logger.info("Running the tests in %d processes in parallel", CONCURRENCY)
+
+    # We need to explicitly flush here in order to avoid multiprocessing
+    # related log output duplications due to picking inputs and globals as the
+    # default IPC mechanism
+    memory_handler.flush()
+
+    start = time()
+    runtime = 0
+    returncodes = set()
+
+    with Pool(CONCURRENCY) as p:
+        for result in p.imap(run_tests, test_run_params):
+            runtime += result.get("runtime")
+            returncodes.add(result.get("returncode", 1))
+
+    logger.info("Aggregate runtime %s.", humanize_time(runtime))
+    logger.info("Wallclock runtime %s.", humanize_time(time() - start))
+
+    success = not any(returncodes)
+    if success:
+        logger.info("No tests failed.")
+    else:
+        logger.error("Tests failed!.")
+    return success
+
+
+# Having the __main__ guard is necessary for multiprocessing.Pool().
+if __name__ == "__main__":
+    # SIGINT kills dead
+    setup_termination()
+
+    # Globals
+    environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    environ["PYTHONUNBUFFERED"] = "1"
+    environ["ROBOTSUITE_PREFIX"] = "ROBOT"
+
+    CONCURRENCY = cpu_count()
+    BUILDOUT_PATH = path.abspath(path.join(__file__, "..", ".."))
+    SOURCE_PATH = path.join(BUILDOUT_PATH, "src")
+
+    # Logging
+    default_loglevel = INFO
+    logger = getLogger("mtest")
+    logger.setLevel(default_loglevel)
+
+    # Set up logging to stdout
+    stream_handler = StreamHandler()
+    stream_handler.setLevel(default_loglevel)
+    log_formatter = Formatter(
+        " - ".join(("%(asctime)s", "%(levelname)s", "%(message)s"))
+    )
+
+    stream_handler.setFormatter(log_formatter)
+    # Buffer log messages so we do not get broken-by-racecondition lines
+    memory_handler = MemoryHandler(2, target=stream_handler)
+    memory_handler.setLevel(default_loglevel)
+    logger.addHandler(memory_handler)
+
+    # Set up a separate logger for writing failure output to stdout. We do this
+    # because the logging module handles I/O encoding properly, whereas with
+    # 'print' we'd need to do it ourselves. (Think piping the output of
+    # bin/mtest somewhere, or shell I/O redirection).
+    log_output = getLogger("mtest.output")
+    log_output.propagate = False
+    stdout_handler = StreamHandler(stream=sys.stdout)
+    stdout_handler.setFormatter(Formatter(""))
+    log_output.addHandler(stdout_handler)
+    log_output.setLevel(INFO)
+
+    # CLI arguments
+    parser = ArgumentParser(
+        description="Run tests in parallel.",
+        epilog="At least one of --plone or --robot is required. "
+        "You must also define either chromedriver or geckodriver for Robot tests.",
+    )
+    parser.add_argument("--plone", action="store_true", help="Run Dexterity tests.")
+    parser.add_argument(
+        "--robot", help="Run Robot tets with the selenium driver you define."
+    )
+    parser.add_argument(
+        "--screen",
+        help="Run Robot tets with a defined XVFB screen size. Only applies if 'xvfb-run' is on your $PATH. Defaults to 1920x1200x24.",
+        default="1920x1200x24",
+    )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        help="Set the testing concurrency level. "
+        "Defaults to the number of system threads.",
+    )
+
+    args = parser.parse_args()
+    if not any((args.plone, args.robot)):
+        parser.print_help()
+        exit(1)
+
+    if args.jobs:
+        CONCURRENCY = int(args.jobs)
+
+    TEST_SUITES = {}
+
+    if args.plone:
+        TEST_SUITES["plone"] = ("bin/test", "--all", "--list-tests", "-t", "!ROBOT")
+
+    if args.robot:
+        TEST_SUITES["robot"] = ("bin/test", "--all", "--list-tests", "-t", "ROBOT")
+        robot_browsers = {"chromedriver": "chrome", "geckodriver": "firefox"}
+        browser = robot_browsers.get(args.robot)
+        if browser:
+            environ["ROBOT_BROWSER"] = browser
+        else:
+            parser.print_help()
+            exit(1)
+        logger.info("Selenium browser: %s", browser)
+        if which("xvfb-run"):
+            screen = args.screen
+            logger.info(
+                "Using 'xvfb-run -a' to wrap the tests with a screen size of {}.".format(
+                    screen
+                )
+            )
+            environ["XVFB_SCREEN_SIZE"] = screen
+
+    if main():
+        exit(0)
+
+    exit(1)

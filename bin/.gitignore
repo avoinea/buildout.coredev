@@ -1,0 +1,6 @@
+*
+!mtest
+!mtest3
+!mtest3-batching
+!mtest3-isolate-classes
+!mtest3-isolate-tests
